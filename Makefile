@@ -19,14 +19,22 @@ kernel.o: kernel.cpp font.hpp
 myos.bin: $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o myos.bin $(OBJS)
 
-myos.iso: myos.bin grub.cfg
+initrd.tar:
+	mkdir -p rootfs
+	echo "Welcome to LiteOS Filesystem!\nYou can edit this text right here in Notepad.\nClick [Save File] to store changes." > rootfs/readme.txt
+	echo "System configuration:\nResolution=1024x768\nColorDepth=32bpp\nDriver=VBE Framebuffer\nStorage=TAR VFS" > rootfs/config.sys
+	echo "- Buy milk\n- Write an OS in C++\n- Draw a picture in Paint" > rootfs/notes.txt
+	tar -cf initrd.tar -C rootfs .
+
+myos.iso: myos.bin grub.cfg initrd.tar
 	mkdir -p isodir/boot/grub
 	cp myos.bin isodir/boot/
+	cp initrd.tar isodir/boot/
 	cp grub.cfg isodir/boot/grub/
 	grub-mkrescue -o myos.iso isodir
 
 run: myos.iso
-	qemu-system-i386 -cdrom myos.iso
+	qemu-system-i386 -cdrom myos.iso -m 256M -vga std
 
 clean:
-	rm -rf *.o myos.bin myos.iso isodir
+	rm -rf *.o myos.bin myos.iso isodir initrd.tar rootfs
