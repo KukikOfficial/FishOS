@@ -15,7 +15,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc-multilib g++-multilib grub-pc-bin grub-common xorriso
+          sudo apt-get install -y build-essential gcc-multilib g++-multilib grub-pc-bin grub-common xorriso mtools
 
       - name: Compile and generate ISO
         run: make
