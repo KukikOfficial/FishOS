@@ -52,6 +52,16 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+static inline void outw(uint16_t port, uint16_t val) {
+    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 // --- СТРОКОВЫЕ УТИЛИТЫ ---
 int kstrlen(const char* s) {
     int len = 0;
@@ -84,7 +94,7 @@ void int_to_str(int n, char* buf) {
     }
 }
 
-// --- CMOS RTC (АППАРАТНЫЕ ЧАСЫ) ---
+// --- CMOS RTC (ЧАСЫ) ---
 static uint8_t rtc_read(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
@@ -108,7 +118,46 @@ void get_rtc_time(int& h, int& m, int& s) {
     }
 }
 
-// --- TAR VFS (ВИРТУАЛЬНАЯ ФАЙЛОВАЯ СИСТЕМА) ---
+// --- ДРАЙВЕР ЖЕСТКОГО ДИСКА (ATA IDE PIO) ДЛЯ ПОСТОЯННОГО ХРАНЕНИЯ ---
+static bool ata_present = false;
+
+void ata_wait_ready() {
+    while (inb(0x1F7) & 0x80);
+    while (!(inb(0x1F7) & 0x08));
+}
+
+void ata_read_sector(uint32_t lba, uint8_t* buffer) {
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t)lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    outb(0x1F7, 0x20); // READ SECTORS
+    ata_wait_ready();
+    for (int i = 0; i < 256; i++) {
+        uint16_t data = inw(0x1F0);
+        buffer[i * 2] = data & 0xFF;
+        buffer[i * 2 + 1] = (data >> 8) & 0xFF;
+    }
+}
+
+void ata_write_sector(uint32_t lba, const uint8_t* buffer) {
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t)lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    outb(0x1F7, 0x30); // WRITE SECTORS
+    ata_wait_ready();
+    for (int i = 0; i < 256; i++) {
+        uint16_t data = buffer[i * 2] | (buffer[i * 2 + 1] << 8);
+        outw(0x1F0, data);
+    }
+    outb(0x1F7, 0xE7); // CACHE FLUSH
+    while (inb(0x1F7) & 0x80);
+}
+
+// --- ФАЙЛОВАЯ СИСТЕМА (VFS + HDD PERSISTENCE) ---
 struct tar_header {
     char filename[100];
     char mode[8];
@@ -129,11 +178,11 @@ struct tar_header {
     char pad[12];
 };
 
-constexpr int MAX_FILES = 16;
-constexpr int MAX_FILE_SIZE = 2048;
+constexpr int MAX_FILES = 12;
+constexpr int MAX_FILE_SIZE = 1536;
 
 struct VFSFile {
-    char name[48];
+    char name[32];
     uint32_t size;
     char content[MAX_FILE_SIZE];
     bool used;
@@ -141,6 +190,8 @@ struct VFSFile {
 
 static VFSFile vfs[MAX_FILES];
 static int vfs_file_count = 0;
+
+void vfs_sync_to_disk();
 
 static uint32_t oct2bin(const char* str, int size) {
     uint32_t n = 0;
@@ -167,26 +218,77 @@ void vfs_add_file(const char* name, const char* data, uint32_t size) {
     f.content[f.size] = '\0';
 }
 
+void vfs_delete_file(int index) {
+    if (index < 0 || index >= vfs_file_count) return;
+    for (int i = index; i < vfs_file_count - 1; i++) {
+        vfs[i] = vfs[i + 1];
+    }
+    vfs_file_count--;
+    vfs_sync_to_disk();
+}
+
 void vfs_save_file(const char* name, const char* data, uint32_t size) {
     for (int i = 0; i < vfs_file_count; i++) {
         if (kstrcmp(vfs[i].name, name)) {
             vfs[i].size = (size < MAX_FILE_SIZE - 1) ? size : MAX_FILE_SIZE - 1;
             for (uint32_t j = 0; j < vfs[i].size; j++) vfs[i].content[j] = data[j];
             vfs[i].content[vfs[i].size] = '\0';
+            vfs_sync_to_disk();
             return;
         }
     }
     vfs_add_file(name, data, size);
+    vfs_sync_to_disk();
+}
+
+// Запись всей VFS на жесткий диск (LBA 100+)
+void vfs_sync_to_disk() {
+    if (!ata_present) return;
+    uint8_t sector[512] = {0};
+    // Сигнатура "FS01" и количество файлов
+    sector[0] = 'F'; sector[1] = 'S'; sector[2] = '0'; sector[3] = '1';
+    sector[4] = static_cast<uint8_t>(vfs_file_count);
+    ata_write_sector(100, sector);
+
+    uint8_t* raw = reinterpret_cast<uint8_t*>(vfs);
+    uint32_t total_bytes = sizeof(VFSFile) * MAX_FILES;
+    uint32_t num_sectors = (total_bytes + 511) / 512;
+    for (uint32_t s = 0; s < num_sectors; s++) {
+        ata_write_sector(101 + s, raw + s * 512);
+    }
 }
 
 void vfs_init(uint32_t mod_start, uint32_t mod_end) {
     vfs_file_count = 0;
+
+    // Проверяем наличие IDE Primary Master диска
+    uint8_t st = inb(0x1F7);
+    if (st != 0xFF && st != 0x00) {
+        uint8_t check_sec[512];
+        ata_read_sector(100, check_sec);
+        if (check_sec[0] == 'F' && check_sec[1] == 'S' && check_sec[2] == '0' && check_sec[3] == '1') {
+            // Диск уже был отформатирован — читаем данные из него!
+            ata_present = true;
+            vfs_file_count = check_sec[4];
+            uint8_t* raw = reinterpret_cast<uint8_t*>(vfs);
+            uint32_t total_bytes = sizeof(VFSFile) * MAX_FILES;
+            uint32_t num_sectors = (total_bytes + 511) / 512;
+            for (uint32_t s = 0; s < num_sectors; s++) {
+                ata_read_sector(101 + s, raw + s * 512);
+            }
+            return;
+        } else {
+            // Диск подключён, но пустой: включим ATA и запишем базовые файлы
+            ata_present = true;
+        }
+    }
+
+    // Если на диске ничего нет, загружаем из initrd.tar
     if (mod_start != 0 && mod_end > mod_start) {
         uint32_t ptr = mod_start;
         while (ptr < mod_end) {
             auto* hdr = reinterpret_cast<tar_header*>(ptr);
             if (hdr->filename[0] == '\0') break;
-
             uint32_t sz = oct2bin(hdr->size, 11);
             if (hdr->typeflag[0] == '0' || hdr->typeflag[0] == '\0') {
                 const char* data = reinterpret_cast<const char*>(ptr + 512);
@@ -197,9 +299,11 @@ void vfs_init(uint32_t mod_start, uint32_t mod_end) {
     }
 
     if (vfs_file_count == 0) {
-        vfs_add_file("readme.txt", "Welcome to LiteOS RAM VFS!\nType something here.", 46);
-        vfs_add_file("todo.txt", "1. Open Paint\n2. Draw some art\n3. Enjoy your OS!", 47);
+        vfs_add_file("readme.txt", "Welcome to LiteOS Filesystem!\nEdit this file and save it.", 57);
+        vfs_add_file("todo.txt", "1. Test minimize button\n2. Test delete button\n3. Draw art", 58);
     }
+
+    vfs_sync_to_disk();
 }
 
 // --- ГРАФИКА И ДВОЙНАЯ БУФЕРИЗАЦИЯ ---
@@ -315,9 +419,9 @@ void draw_cursor(int mx, int my) {
 
 // --- СОСТОЯНИЕ ПРИЛОЖЕНИЙ ---
 // 1. Блокнот
-char notepad_buffer[MAX_FILE_SIZE] = "Welcome to LiteOS Notepad!\nClick anywhere in this window and start typing.";
-int notepad_cursor = 72;
-char notepad_filename[48] = "readme.txt";
+char notepad_buffer[MAX_FILE_SIZE] = "";
+int notepad_cursor = 0;
+char notepad_filename[32] = "readme.txt";
 
 // 2. Paint
 constexpr int PAINT_W = 310;
@@ -327,23 +431,24 @@ uint32_t palette[6] = { 0x000000, 0xEF4444, 0x22C55E, 0x3B82F6, 0xEAB308, 0xFFFF
 int active_color_idx = 0;
 
 void clear_canvas() {
-    for (int i = 0; i < PAINT_W * PAINT_H; i++) {
-        paint_canvas[i] = 0xFFFFFF;
-    }
+    for (int i = 0; i < PAINT_W * PAINT_H; i++) paint_canvas[i] = 0xFFFFFF;
 }
 
-// 3. Оконный менеджер
+// 3. Окна
 struct Window {
     int id; // 0 = Explorer, 1 = Notepad, 2 = Paint
     int x, y, w, h;
+    int orig_x, orig_y, orig_w, orig_h;
     const char* title;
     bool closed;
+    bool minimized;
+    bool maximized;
 };
 
 Window windows[3] = {
-    { 0,  40,  50, 320, 340, "File Explorer [VFS]", false },
-    { 1, 380,  50, 500, 340, "Text Editor (Notepad)", false },
-    { 2, 200, 380, 334, 250, "LitePaint Studio", false }
+    { 0,  40,  50, 360, 340, 40,  50, 360, 340, "File Explorer [VFS]", false, false, false },
+    { 1, 420,  50, 520, 340, 420,  50, 520, 340, "Text Editor (Notepad)", false, false, false },
+    { 2, 200, 380, 334, 250, 200, 380, 334, 250, "LitePaint Studio", false, false, false }
 };
 
 int z_order[3] = { 0, 1, 2 };
@@ -357,56 +462,95 @@ bool start_menu_open = false;
 bool shift_pressed = false;
 int blink_timer = 0;
 
-// Отрисовка окон и содержимого
-void draw_window(const Window& win, bool active) {
-    if (win.closed) return;
+void toggle_maximize(Window& win) {
+    if (!win.maximized) {
+        win.orig_x = win.x;
+        win.orig_y = win.y;
+        win.orig_w = win.w;
+        win.orig_h = win.h;
+        win.x = 0;
+        win.y = 0;
+        win.w = SCREEN_W;
+        win.h = SCREEN_H - 32;
+        win.maximized = true;
+    } else {
+        win.x = win.orig_x;
+        win.y = win.orig_y;
+        win.w = win.orig_w;
+        win.h = win.orig_h;
+        win.maximized = false;
+    }
+}
 
-    draw_shadow(win.x + 6, win.y + 6, win.w, win.h);
+// Отрисовка окон
+void draw_window(const Window& win, bool active) {
+    if (win.closed || win.minimized) return;
+
+    if (!win.maximized) draw_shadow(win.x + 6, win.y + 6, win.w, win.h);
     fill_rect(win.x, win.y, win.w, win.h, 0xF8FAFC);
     draw_rect(win.x, win.y, win.w, win.h, 0x475569);
 
-    // Заголовок окна
+    // Заголовок
     draw_gradient_v(win.x + 1, win.y + 1, win.w - 2, 24, active ? 0x2563EB : 0x64748B, active ? 0x1E40AF : 0x334155);
     draw_string(win.x + 8, win.y + 7, win.title, 0xFFFFFF);
 
-    // Кнопка закрытия [X]
-    int btn_x = win.x + win.w - 20;
-    int btn_y = win.y + 4;
-    fill_rect(btn_x, btn_y, 16, 16, 0xEF4444);
-    draw_string(btn_x + 4, btn_y + 4, "X", 0xFFFFFF);
+    // Кнопки заголовка: [ _ ] [ □ ] [ X ]
+    int bx_close = win.x + win.w - 20;
+    int bx_max   = win.x + win.w - 38;
+    int bx_min   = win.x + win.w - 56;
+    int by = win.y + 4;
+
+    // [X] Закрыть
+    fill_rect(bx_close, by, 16, 16, 0xEF4444);
+    draw_string(bx_close + 4, by + 4, "X", 0xFFFFFF);
+
+    // [□] Во весь экран
+    fill_rect(bx_max, by, 16, 16, 0x3B82F6);
+    draw_rect(bx_max + 3, by + 3, 10, 10, 0xFFFFFF);
+
+    // [_] Свернуть
+    fill_rect(bx_min, by, 16, 16, 0x64748B);
+    fill_rect(bx_min + 3, by + 11, 10, 2, 0xFFFFFF);
 
     int cx = win.x + 12;
     int cy = win.y + 34;
 
-    // --- 0: ФАЙЛОВЫЙ МЕНЕДЖЕР ---
+    // --- 0: FILE EXPLORER ---
     if (win.id == 0) {
-        draw_string(cx, cy, "Files in Memory (TAR VFS):", 0x0F172A);
+        draw_string(cx, cy, ata_present ? "Storage: Virtual IDE Hard Disk (Persistent)" : "Storage: RAM VFS (Temporary)", ata_present ? 0x16A34A : 0xD97706);
         cy += 18;
 
         for (int i = 0; i < vfs_file_count; i++) {
             bool is_cur = kstrcmp(notepad_filename, vfs[i].name);
-            fill_rect(cx, cy, win.w - 24, 24, is_cur ? 0xDBEAFE : 0xFFFFFF);
-            draw_rect(cx, cy, win.w - 24, 24, is_cur ? 0x3B82F6 : 0xCBD5E1);
+            int item_w = win.w - 78;
 
+            // Кнопка выбора файла
+            fill_rect(cx, cy, item_w, 24, is_cur ? 0xDBEAFE : 0xFFFFFF);
+            draw_rect(cx, cy, item_w, 24, is_cur ? 0x3B82F6 : 0xCBD5E1);
             draw_string(cx + 8, cy + 7, vfs[i].name, 0x0F172A);
 
             char sz_buf[16];
             int_to_str(vfs[i].size, sz_buf);
-            draw_string(cx + 190, cy + 7, sz_buf, 0x64748B);
-            draw_string(cx + 240, cy + 7, "B", 0x64748B);
+            draw_string(cx + item_w - 60, cy + 7, sz_buf, 0x64748B);
+            draw_string(cx + item_w - 20, cy + 7, "B", 0x64748B);
+
+            // Кнопка [Del]
+            int del_x = cx + item_w + 6;
+            fill_rect(del_x, cy, 48, 24, 0xFEE2E2);
+            draw_rect(del_x, cy, 48, 24, 0xEF4444);
+            draw_string(del_x + 12, cy + 7, "Del", 0xDC2626);
 
             cy += 28;
         }
 
-        // Кнопка создания файла
+        // Кнопка "+ New File"
         int n_btn_y = win.y + win.h - 32;
         fill_rect(cx, n_btn_y, 110, 24, 0x10B981);
         draw_rect(cx, n_btn_y, 110, 24, 0x059669);
         draw_string(cx + 12, n_btn_y + 7, "+ New File", 0xFFFFFF);
     }
-    // --- 1: БЛОКНОТ ---
+    // --- 1: NOTEPAD ---
     else if (win.id == 1) {
-        // Верхняя панель: имя файла и кнопка сохранения
         draw_string(cx, cy + 4, "File: ", 0x64748B);
         draw_string(cx + 42, cy + 4, notepad_filename, 0x0F172A);
 
@@ -414,64 +558,60 @@ void draw_window(const Window& win, bool active) {
         fill_rect(save_btn_x, cy, 98, 22, 0x2563EB);
         draw_rect(save_btn_x, cy, 98, 22, 0x1D4ED8);
         draw_string(save_btn_x + 10, cy + 6, "[Save File]", 0xFFFFFF);
-
         cy += 28;
 
-        // Область редактора текста
         int edit_w = win.w - 24;
         int edit_h = win.h - 72;
         fill_rect(cx, cy, edit_w, edit_h, 0xFFFFFF);
         draw_rect(cx, cy, edit_w, edit_h, 0x94A3B8);
 
-        // Отрисовка текста
-        int text_x = cx + 6;
-        int text_y = cy + 6;
+        // Безопасная отрисовка текста с защитой от вылета за окно
+        int text_x = cx + 8;
+        int text_y = cy + 8;
         int cur_x = text_x;
         int cur_y = text_y;
+        int max_x = cx + edit_w - 16;
+        int max_y = cy + edit_h - 14;
 
         for (int i = 0; notepad_buffer[i] != '\0'; i++) {
             if (i == notepad_cursor && (blink_timer % 40 < 20)) {
-                fill_rect(cur_x, cur_y, 2, 10, 0x2563EB);
+                if (cur_y <= max_y) fill_rect(cur_x, cur_y, 2, 10, 0x2563EB);
             }
+
             if (notepad_buffer[i] == '\n') {
                 cur_x = text_x;
                 cur_y += 12;
             } else {
-                draw_char(cur_x, cur_y, notepad_buffer[i], 0x0F172A);
+                if (cur_y <= max_y) {
+                    draw_char(cur_x, cur_y, notepad_buffer[i], 0x0F172A);
+                }
                 cur_x += 8;
-                if (cur_x > cx + edit_w - 12) {
+                if (cur_x >= max_x) {
                     cur_x = text_x;
                     cur_y += 12;
                 }
             }
         }
-        // Каретка в самом конце текста
         if (notepad_cursor == kstrlen(notepad_buffer) && (blink_timer % 40 < 20)) {
-            fill_rect(cur_x, cur_y, 2, 10, 0x2563EB);
+            if (cur_y <= max_y) fill_rect(cur_x, cur_y, 2, 10, 0x2563EB);
         }
     }
     // --- 2: PAINT ---
     else if (win.id == 2) {
-        // Палитра
         int pal_x = cx;
         for (int i = 0; i < 6; i++) {
             fill_rect(pal_x, cy, 20, 20, palette[i]);
             draw_rect(pal_x, cy, 20, 20, (active_color_idx == i) ? 0x000000 : 0x94A3B8);
-            if (active_color_idx == i) {
-                draw_rect(pal_x + 2, cy + 2, 16, 16, 0xFFFFFF);
-            }
+            if (active_color_idx == i) draw_rect(pal_x + 2, cy + 2, 16, 16, 0xFFFFFF);
             pal_x += 26;
         }
 
-        // Кнопка очистки холста
         int clr_x = win.x + win.w - 80;
         fill_rect(clr_x, cy, 68, 20, 0xE2E8F0);
         draw_rect(clr_x, cy, 68, 20, 0x94A3B8);
         draw_string(clr_x + 8, cy + 5, "Clear", 0x0F172A);
-
         cy += 26;
 
-        // Холст
         draw_rect(cx - 1, cy - 1, PAINT_W + 2, PAINT_H + 2, 0x64748B);
         for (int py = 0; py < PAINT_H; py++) {
             uint32_t* row = &backbuffer[(cy + py) * SCREEN_W + cx];
@@ -484,49 +624,29 @@ void draw_window(const Window& win, bool active) {
 }
 
 // --- PS/2 МЫШЬ ---
-void mouse_wait_write() {
-    uint32_t t = 100000;
-    while (t-- && (inb(0x64) & 2));
-}
-
-void mouse_wait_read() {
-    uint32_t t = 100000;
-    while (t-- && !(inb(0x64) & 1));
-}
+void mouse_wait_write() { uint32_t t = 100000; while (t-- && (inb(0x64) & 2)); }
+void mouse_wait_read()  { uint32_t t = 100000; while (t-- && !(inb(0x64) & 1)); }
 
 void mouse_write(uint8_t val) {
-    mouse_wait_write();
-    outb(0x64, 0xD4);
-    mouse_wait_write();
-    outb(0x60, val);
+    mouse_wait_write(); outb(0x64, 0xD4);
+    mouse_wait_write(); outb(0x60, val);
 }
 
 uint8_t mouse_read() {
-    mouse_wait_read();
-    return inb(0x60);
+    mouse_wait_read(); return inb(0x60);
 }
 
 void mouse_init() {
-    mouse_wait_write();
-    outb(0x64, 0xA8);
-
-    mouse_wait_write();
-    outb(0x64, 0x20);
+    mouse_wait_write(); outb(0x64, 0xA8);
+    mouse_wait_write(); outb(0x64, 0x20);
     uint8_t status = mouse_read();
-    status &= ~(1 << 5);
-    status &= ~(1 << 1);
-    status &= ~(1 << 0);
-
-    mouse_wait_write();
-    outb(0x64, 0x60);
-    mouse_wait_write();
-    outb(0x60, status);
-
+    status &= ~(1 << 5); status &= ~(1 << 1); status &= ~(1 << 0);
+    mouse_wait_write(); outb(0x64, 0x60);
+    mouse_wait_write(); outb(0x60, status);
     mouse_write(0xF6); mouse_read();
     mouse_write(0xF4); mouse_read();
 }
 
-// Преобразование скан-кода PS/2 в ASCII
 char scancode_to_char(uint8_t sc, bool shift) {
     switch (sc) {
         case 0x02: return shift ? '!' : '1';
@@ -583,30 +703,20 @@ void process_inputs() {
     while (true) {
         uint8_t st = inb(0x64);
         if (!(st & 1)) break;
-
         uint8_t data = inb(0x60);
 
         if (st & 0x20) {
-            // Данные мыши
             switch (cycle) {
                 case 0:
                     if (data & 0x08) { packet[0] = data; cycle = 1; }
                     break;
-                case 1:
-                    packet[1] = data; cycle = 2;
-                    break;
+                case 1: packet[1] = data; cycle = 2; break;
                 case 2:
                     packet[2] = data; cycle = 0;
                     mouse_btn_left = (packet[0] & 1);
-
-                    int dx = packet[1];
-                    if (packet[0] & 0x10) dx -= 256;
-                    int dy = packet[2];
-                    if (packet[0] & 0x20) dy -= 256;
-
-                    mouse_x += dx;
-                    mouse_y -= dy;
-
+                    int dx = packet[1]; if (packet[0] & 0x10) dx -= 256;
+                    int dy = packet[2]; if (packet[0] & 0x20) dy -= 256;
+                    mouse_x += dx; mouse_y -= dy;
                     if (mouse_x < 0) mouse_x = 0;
                     if (mouse_x >= SCREEN_W) mouse_x = SCREEN_W - 1;
                     if (mouse_y < 0) mouse_y = 0;
@@ -614,14 +724,12 @@ void process_inputs() {
                     break;
             }
         } else {
-            // Данные клавиатуры
             if (data == 0x2A || data == 0x36) shift_pressed = true;
             else if (data == 0xAA || data == 0xB6) shift_pressed = false;
             else if (!(data & 0x80)) {
-                // Если активно окно Notepad (id 1) и оно на переднем плане
-                if (z_order[2] == 1 && !windows[1].closed) {
+                // Ввод текста в Notepad если он активен и не свернут
+                if (z_order[2] == 1 && !windows[1].closed && !windows[1].minimized) {
                     if (data == 0x0E) {
-                        // Backspace
                         if (notepad_cursor > 0) {
                             int len = kstrlen(notepad_buffer);
                             for (int i = notepad_cursor - 1; i < len; i++) {
@@ -642,8 +750,6 @@ void process_inputs() {
                         }
                     }
                 }
-
-                // Управление курсором стрелками
                 if (data == 0x48) mouse_y -= 10;
                 if (data == 0x50) mouse_y += 10;
                 if (data == 0x4B) mouse_x -= 10;
@@ -661,7 +767,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
     if (magic != 0x2BADB002) return;
 
     auto* mbi = reinterpret_cast<multiboot_info*>(addr);
-
     uint32_t* vram = nullptr;
     uint32_t pitch_bytes = SCREEN_W * 4;
 
@@ -676,16 +781,15 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
 
     if (!vram) return;
 
-    // Инициализация файловой системы TAR VFS из модуля GRUB
     uint32_t mod_start = 0, mod_end = 0;
     if ((mbi->flags & (1 << 3)) && mbi->mods_count > 0) {
         auto* mod = reinterpret_cast<multiboot_module*>(mbi->mods_addr);
         mod_start = mod->mod_start;
         mod_end = mod->mod_end;
     }
+
     vfs_init(mod_start, mod_end);
 
-    // Загрузка первого файла в редактор
     if (vfs_file_count > 0) {
         kstrcpy(notepad_filename, vfs[0].name);
         kstrcpy(notepad_buffer, vfs[0].content);
@@ -697,7 +801,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
 
     bool prev_lclick = false;
 
-    // Главный цикл ОС
     while (true) {
         blink_timer++;
         process_inputs();
@@ -706,14 +809,13 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
         bool lclick_released = (prev_lclick && !mouse_btn_left);
         prev_lclick = mouse_btn_left;
 
-        // --- ОБРАБОТКА PAINT ПРИ ЗАЖАТОЙ ЛКМ ---
-        if (mouse_btn_left && z_order[2] == 2 && !windows[2].closed) {
+        // Рисование в Paint
+        if (mouse_btn_left && z_order[2] == 2 && !windows[2].closed && !windows[2].minimized) {
             int cx = windows[2].x + 12;
             int cy = windows[2].y + 60;
             if (mouse_x >= cx && mouse_x < cx + PAINT_W && mouse_y >= cy && mouse_y < cy + PAINT_H) {
                 int px = mouse_x - cx;
                 int py = mouse_y - cy;
-                // Кисть размером 2x2 пикселя
                 for (int dy = 0; dy <= 1; dy++) {
                     for (int dx = 0; dx <= 1; dx++) {
                         if (px + dx < PAINT_W && py + dy < PAINT_H) {
@@ -724,84 +826,151 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
             }
         }
 
-        // --- ОБРАБОТКА ОДИНОЧНОГО КЛИКА МЫШИ ---
+        // ОБРАБОТКА НАЖАТИЯ МЫШИ
         if (lclick_pressed) {
-            // Клик по кнопке «Start»
-            if (mouse_x >= 4 && mouse_x <= 84 && mouse_y >= SCREEN_H - 28 && mouse_y <= SCREEN_H - 4) {
-                start_menu_open = !start_menu_open;
-            }
-            // Клик по меню «Start»
-            else if (start_menu_open && mouse_x >= 4 && mouse_x <= 164 && mouse_y >= SCREEN_H - 120 && mouse_y < SCREEN_H - 32) {
-                if (mouse_y >= SCREEN_H - 60) {
-                    outb(0x64, 0xFE); // Перезагрузка ПК
+            // 1. Клик по панели задач
+            if (mouse_y >= SCREEN_H - 32) {
+                // Кнопка «Start»
+                if (mouse_x >= 4 && mouse_x <= 84) {
+                    start_menu_open = !start_menu_open;
                 } else {
-                    for (int i = 0; i < 3; i++) windows[i].closed = false;
+                    // Клик по вкладкам окон на панели задач
+                    for (int i = 0; i < 3; i++) {
+                        int tab_x = 94 + i * 140;
+                        if (mouse_x >= tab_x && mouse_x <= tab_x + 130) {
+                            if (windows[i].closed) {
+                                windows[i].closed = false;
+                                windows[i].minimized = false;
+                                for (int k = 0; k < 2; k++) if (z_order[k] == i) { z_order[k] = z_order[k+1]; z_order[2] = i; }
+                            } else if (windows[i].minimized) {
+                                windows[i].minimized = false;
+                                for (int k = 0; k < 2; k++) if (z_order[k] == i) { z_order[k] = z_order[k+1]; z_order[2] = i; }
+                            } else if (z_order[2] == i) {
+                                // Клик по активному окну сворачивает его
+                                windows[i].minimized = true;
+                            } else {
+                                // Вывод на передний план
+                                for (int k = 0; k < 2; k++) if (z_order[k] == i) { z_order[k] = z_order[k+1]; z_order[2] = i; }
+                            }
+                            break;
+                        }
+                    }
                     start_menu_open = false;
                 }
+            }
+            // 2. Клик внутри меню «Start»
+            else if (start_menu_open && mouse_x >= 4 && mouse_x <= 164 && mouse_y >= SCREEN_H - 146 && mouse_y < SCREEN_H - 32) {
+                if (mouse_y >= SCREEN_H - 56) {
+                    outb(0x64, 0xFE); // Reboot
+                } else if (mouse_y >= SCREEN_H - 86) {
+                    windows[2].closed = false; windows[2].minimized = false; z_order[2] = 2; // Paint
+                } else if (mouse_y >= SCREEN_H - 116) {
+                    windows[1].closed = false; windows[1].minimized = false; z_order[2] = 1; // Notepad
+                } else {
+                    windows[0].closed = false; windows[0].minimized = false; z_order[2] = 0; // Explorer
+                }
+                start_menu_open = false;
             } else {
                 start_menu_open = false;
 
-                // Проверка окон сверху вниз
+                // 3. Клик по окнам (проверка сверху вниз)
                 bool handled = false;
                 for (int i = 2; i >= 0; i--) {
                     int w_idx = z_order[i];
                     Window& win = windows[w_idx];
-                    if (win.closed) continue;
+                    if (win.closed || win.minimized) continue;
 
                     if (mouse_x >= win.x && mouse_x < win.x + win.w &&
                         mouse_y >= win.y && mouse_y < win.y + win.h) {
 
-                        // Перемещаем окно наверх списка Z-order
+                        // На передний план
                         for (int k = i; k < 2; k++) z_order[k] = z_order[k + 1];
                         z_order[2] = w_idx;
 
+                        int bx_close = win.x + win.w - 20;
+                        int bx_max   = win.x + win.w - 38;
+                        int bx_min   = win.x + win.w - 56;
+                        int by = win.y + 4;
+
                         // Кнопка [X]
-                        if (mouse_x >= win.x + win.w - 20 && mouse_x <= win.x + win.w - 4 &&
-                            mouse_y >= win.y + 4 && mouse_y <= win.y + 20) {
+                        if (mouse_x >= bx_close && mouse_x <= bx_close + 16 && mouse_y >= by && mouse_y <= by + 16) {
                             win.closed = true;
                         }
-                        // Заголовок (перетаскивание)
-                        else if (mouse_y <= win.y + 24) {
-                            dragging_window = w_idx;
-                            drag_offset_x = mouse_x - win.x;
-                            drag_offset_y = mouse_y - win.y;
+                        // Кнопка [□]
+                        else if (mouse_x >= bx_max && mouse_x <= bx_max + 16 && mouse_y >= by && mouse_y <= by + 16) {
+                            toggle_maximize(win);
                         }
-                        // Кнопки File Explorer
+                        // Кнопка [_]
+                        else if (mouse_x >= bx_min && mouse_x <= bx_min + 16 && mouse_y >= by && mouse_y <= by + 16) {
+                            win.minimized = true;
+                        }
+                        // Перетаскивание за заголовок
+                        else if (mouse_y <= win.y + 24) {
+                            if (!win.maximized) {
+                                dragging_window = w_idx;
+                                drag_offset_x = mouse_x - win.x;
+                                drag_offset_y = mouse_y - win.y;
+                            }
+                        }
+                        // File Explorer: выбор или удаление файла
                         else if (win.id == 0) {
                             int file_y = win.y + 52;
+                            int item_w = win.w - 78;
+
                             for (int f = 0; f < vfs_file_count; f++) {
-                                if (mouse_x >= win.x + 12 && mouse_x <= win.x + win.w - 12 &&
+                                // Клик по файлу (открыть)
+                                if (mouse_x >= win.x + 12 && mouse_x <= win.x + 12 + item_w &&
                                     mouse_y >= file_y && mouse_y <= file_y + 24) {
                                     kstrcpy(notepad_filename, vfs[f].name);
                                     kstrcpy(notepad_buffer, vfs[f].content);
                                     notepad_cursor = kstrlen(notepad_buffer);
-                                    windows[1].closed = false; // Открыть блокнот
+                                    windows[1].closed = false;
+                                    windows[1].minimized = false;
+                                    break;
+                                }
+                                // Клик по [Del] (удалить)
+                                int del_x = win.x + 12 + item_w + 6;
+                                if (mouse_x >= del_x && mouse_x <= del_x + 48 &&
+                                    mouse_y >= file_y && mouse_y <= file_y + 24) {
+                                    bool was_current = kstrcmp(notepad_filename, vfs[f].name);
+                                    vfs_delete_file(f);
+                                    if (was_current) {
+                                        if (vfs_file_count > 0) {
+                                            kstrcpy(notepad_filename, vfs[0].name);
+                                            kstrcpy(notepad_buffer, vfs[0].content);
+                                        } else {
+                                            kstrcpy(notepad_filename, "untitled.txt");
+                                            notepad_buffer[0] = '\0';
+                                        }
+                                        notepad_cursor = kstrlen(notepad_buffer);
+                                    }
                                     break;
                                 }
                                 file_y += 28;
                             }
+
                             // Кнопка "+ New File"
                             int n_btn_y = win.y + win.h - 32;
                             if (mouse_x >= win.x + 12 && mouse_x <= win.x + 122 &&
                                 mouse_y >= n_btn_y && mouse_y <= n_btn_y + 24) {
                                 if (vfs_file_count < MAX_FILES) {
-                                    char new_name[32] = "newfile";
+                                    char new_name[32] = "doc";
                                     char idx_str[8];
                                     int_to_str(vfs_file_count + 1, idx_str);
                                     int p = kstrlen(new_name);
                                     for (int s = 0; idx_str[s]; s++) new_name[p++] = idx_str[s];
-                                    new_name[p++] = '.'; new_name[p++] = 't'; new_name[p++] = 'x'; new_name[p++] = 't';
-                                    new_name[p] = '\0';
+                                    new_name[p++] = '.'; new_name[p++] = 't'; new_name[p++] = 'x'; new_name[p++] = 't'; new_name[p] = '\0';
 
-                                    vfs_add_file(new_name, "Empty file.\nStart typing...", 25);
+                                    vfs_save_file(new_name, "New text file.\nType here...", 27);
                                     kstrcpy(notepad_filename, new_name);
-                                    kstrcpy(notepad_buffer, "Empty file.\nStart typing...");
+                                    kstrcpy(notepad_buffer, "New text file.\nType here...");
                                     notepad_cursor = kstrlen(notepad_buffer);
                                     windows[1].closed = false;
+                                    windows[1].minimized = false;
                                 }
                             }
                         }
-                        // Кнопки Блокнота
+                        // Notepad: кнопка Save
                         else if (win.id == 1) {
                             int save_btn_x = win.x + win.w - 110;
                             if (mouse_x >= save_btn_x && mouse_x <= save_btn_x + 98 &&
@@ -809,7 +978,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
                                 vfs_save_file(notepad_filename, notepad_buffer, kstrlen(notepad_buffer));
                             }
                         }
-                        // Кнопки Paint
+                        // Paint: палитра и Clear
                         else if (win.id == 2) {
                             int pal_x = win.x + 12;
                             int pal_y = win.y + 34;
@@ -840,20 +1009,17 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
             windows[dragging_window].y = mouse_y - drag_offset_y;
         }
 
-        if (lclick_released) {
-            dragging_window = -1;
-        }
+        if (lclick_released) dragging_window = -1;
 
         // --- ОТРИСОВКА КАДРА ---
-        // 1. Градиент рабочего стола
         draw_gradient_v(0, 0, SCREEN_W, SCREEN_H - 32, 0x0F172A, 0x1E293B);
 
-        // 2. Окна в порядке Z-Order
+        // Отрисовка видимых окон
         for (int i = 0; i < 3; i++) {
             draw_window(windows[z_order[i]], (i == 2));
         }
 
-        // 3. Панель задач (Taskbar)
+        // Панель задач
         fill_rect(0, SCREEN_H - 32, SCREEN_W, 32, 0x0F172A);
         draw_rect(0, SCREEN_H - 32, SCREEN_W, 1, 0x334155);
 
@@ -865,8 +1031,10 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
         // Вкладки окон
         for (int i = 0; i < 3; i++) {
             int tab_x = 94 + i * 140;
-            fill_rect(tab_x, SCREEN_H - 28, 130, 24, windows[i].closed ? 0x1E293B : 0x334155);
-            draw_rect(tab_x, SCREEN_H - 28, 130, 24, 0x475569);
+            bool is_active_top = (z_order[2] == i && !windows[i].closed && !windows[i].minimized);
+            fill_rect(tab_x, SCREEN_H - 28, 130, 24, is_active_top ? 0x2563EB : (windows[i].closed || windows[i].minimized ? 0x1E293B : 0x334155));
+            draw_rect(tab_x, SCREEN_H - 28, 130, 24, is_active_top ? 0x60A5FA : 0x475569);
+
             char short_title[14];
             for (int s = 0; s < 13; s++) {
                 short_title[s] = windows[i].title[s];
@@ -876,7 +1044,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
             draw_string(tab_x + 8, SCREEN_H - 20, short_title, windows[i].closed ? 0x64748B : 0xFFFFFF);
         }
 
-        // Часы RTC
+        // Часы
         int h = 0, m = 0, s = 0;
         get_rtc_time(h, m, s);
         char time_buf[16];
@@ -888,26 +1056,28 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
         time_buf[8] = '\0';
         draw_string(SCREEN_W - 80, SCREEN_H - 20, time_buf, 0x38BDF8);
 
-        // 4. Меню «Start»
+        // Меню «Start»
         if (start_menu_open) {
-            draw_shadow(4, SCREEN_H - 120, 160, 88);
-            fill_rect(4, SCREEN_H - 120, 160, 88, 0x0F172A);
-            draw_rect(4, SCREEN_H - 120, 160, 88, 0x38BDF8);
+            draw_shadow(4, SCREEN_H - 150, 160, 118);
+            fill_rect(4, SCREEN_H - 150, 160, 118, 0x0F172A);
+            draw_rect(4, SCREEN_H - 150, 160, 118, 0x38BDF8);
+
+            fill_rect(6, SCREEN_H - 146, 156, 24, 0x1E293B);
+            draw_string(14, SCREEN_H - 138, "File Explorer", 0xFFFFFF);
 
             fill_rect(6, SCREEN_H - 116, 156, 24, 0x1E293B);
-            draw_string(14, SCREEN_H - 108, "Restore Windows", 0xFFFFFF);
+            draw_string(14, SCREEN_H - 108, "Text Editor", 0xFFFFFF);
 
-            fill_rect(6, SCREEN_H - 90, 156, 24, 0x1E293B);
-            draw_string(14, SCREEN_H - 82, "LiteOS Terminal", 0xFFFFFF);
+            fill_rect(6, SCREEN_H - 86, 156, 24, 0x1E293B);
+            draw_string(14, SCREEN_H - 78, "Paint Studio", 0xFFFFFF);
 
-            fill_rect(6, SCREEN_H - 64, 156, 26, 0xDC2626);
-            draw_string(14, SCREEN_H - 56, "[ Reboot PC ]", 0xFFFFFF);
+            fill_rect(6, SCREEN_H - 56, 156, 24, 0xDC2626);
+            draw_string(14, SCREEN_H - 48, "[ Reboot PC ]", 0xFFFFFF);
         }
 
-        // 5. Курсор мыши
         draw_cursor(mouse_x, mouse_y);
 
-        // 6. Копирование кадра в VRAM
+        // Вывод на дисплей
         uint32_t pitch_words = pitch_bytes / 4;
         for (int y = 0; y < SCREEN_H; y++) {
             uint32_t* dest = vram + y * pitch_words;
