@@ -2,6 +2,7 @@
 #include "io.hpp"
 #include "gui.hpp"
 #include "idt.hpp"
+#include "timer.hpp"
 
 // RTC
 static uint8_t rtc_read(uint8_t reg) {
@@ -66,11 +67,39 @@ void ata_write_sector(uint32_t lba, const uint8_t* buffer) {
     while (inb(0x1F7) & 0x80);
 }
 
+// Audio Feedback (PC Speaker via PIT Channel 2 & Port 0x61)
+void audio_beep(uint32_t freq, uint32_t ms) {
+    if (freq == 0) return;
+    uint32_t div = 1193180 / freq;
+    outb(0x43, 0xB6);
+    outb(0x42, static_cast<uint8_t>(div & 0xFF));
+    outb(0x42, static_cast<uint8_t>((div >> 8) & 0xFF));
+    uint8_t tmp = inb(0x61);
+    if ((tmp & 3) != 3) {
+        outb(0x61, tmp | 3);
+    }
+    sleep_ms(ms);
+    outb(0x61, inb(0x61) & 0xFC);
+}
+
+void audio_click() {
+    outb(0x43, 0xB6);
+    outb(0x42, 0x80);
+    outb(0x42, 0x03); // ~2400 Hz micro-click
+    uint8_t tmp = inb(0x61);
+    outb(0x61, tmp | 3);
+    for (volatile int i = 0; i < 30000; i = i + 1);
+    outb(0x61, tmp & 0xFC);
+}
+
 // PS/2 Keyboard & Mouse
 int mouse_x = 512;
 int mouse_y = 384;
 bool mouse_btn_left = false;
+bool mouse_btn_right = false;
 bool shift_pressed = false;
+bool ctrl_pressed = false;
+bool alt_pressed = false;
 
 static void mouse_wait_write() { uint32_t t = 100000; while (t-- && (inb(0x64) & 2)); }
 static void mouse_wait_read()  { uint32_t t = 100000; while (t-- && !(inb(0x64) & 1)); }
@@ -137,22 +166,42 @@ static int mouse_cycle = 0;
 static uint8_t mouse_packet[3];
 
 static void on_keyboard_data(uint8_t data) {
-    if (data == 0x2A || data == 0x36) shift_pressed = true;
-    else if (data == 0xAA || data == 0xB6) shift_pressed = false;
-    else if (!(data & 0x80)) {
-        if (data == 0x0E) {
-            gui_handle_backspace();
-        } else {
-            char c = scancode_to_char(data, shift_pressed);
-            if (c) gui_handle_char(c);
+    if (data == 0x2A || data == 0x36) {
+        shift_pressed = true;
+    } else if (data == 0xAA || data == 0xB6) {
+        shift_pressed = false;
+    } else if (data == 0x1D) {
+        ctrl_pressed = true;
+    } else if (data == 0x9D) {
+        ctrl_pressed = false;
+    } else if (data == 0x38) {
+        alt_pressed = true;
+    } else if (data == 0xB8) {
+        alt_pressed = false;
+    } else if (!(data & 0x80)) {
+        // Handle Ctrl+S for instant save
+        if (ctrl_pressed && data == 0x1F) {
+            gui_handle_special_key(KEY_SAVE);
+            return;
         }
-        if (data == 0x48) mouse_y -= 10;
-        if (data == 0x50) mouse_y += 10;
-        if (data == 0x4B) mouse_x -= 10;
-        if (data == 0x4D) mouse_x += 10;
-        if (data == 0x1C) mouse_btn_left = true;
-    } else if (data == 0x9C) {
-        mouse_btn_left = false;
+
+        // Navigation and special keys
+        switch (data) {
+            case 0x0E: gui_handle_backspace(); break;
+            case 0x4B: gui_handle_special_key(KEY_LEFT); break;
+            case 0x4D: gui_handle_special_key(KEY_RIGHT); break;
+            case 0x48: gui_handle_special_key(KEY_UP); break;
+            case 0x50: gui_handle_special_key(KEY_DOWN); break;
+            case 0x47: gui_handle_special_key(KEY_HOME); break;
+            case 0x4F: gui_handle_special_key(KEY_END); break;
+            case 0x53: gui_handle_special_key(KEY_DELETE); break;
+            case 0x0F: gui_handle_special_key(KEY_TAB); break;
+            default: {
+                char c = scancode_to_char(data, shift_pressed);
+                if (c) gui_handle_char(c);
+                break;
+            }
+        }
     }
 }
 
@@ -164,7 +213,9 @@ static void on_mouse_data(uint8_t data) {
         case 1: mouse_packet[1] = data; mouse_cycle = 2; break;
         case 2:
             mouse_packet[2] = data; mouse_cycle = 0;
-            mouse_btn_left = (mouse_packet[0] & 1);
+            mouse_btn_left  = (mouse_packet[0] & 1);
+            mouse_btn_right = (mouse_packet[0] & 2);
+
             int dx = mouse_packet[1]; if (mouse_packet[0] & 0x10) dx -= 256;
             int dy = mouse_packet[2]; if (mouse_packet[0] & 0x20) dy -= 256;
             mouse_x += dx; mouse_y -= dy;
@@ -206,10 +257,13 @@ void mouse_init() {
 
     mouse_write(0xF6); mouse_read();     // Set default settings
     mouse_write(0xF4); mouse_read();     // Enable streaming
+
+    // Pleasant startup audio chime (523Hz C5 -> 659Hz E5)
+    audio_beep(523, 40);
+    audio_beep(659, 60);
 }
 
 void process_inputs() {
-    // Process any pending bytes from keyboard/mouse in case interrupts were disabled
     while (true) {
         uint8_t st = inb(0x64);
         if (!(st & 1)) break;

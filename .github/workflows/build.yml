@@ -1,7 +1,9 @@
-name: Build LiteOS ISO
+name: Build FishOS ISO
 
 on:
   push:
+    branches: [ "main", "master" ]
+  pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
@@ -15,13 +17,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc-multilib g++-multilib grub-pc-bin grub-common xorriso mtools
+          sudo apt-get install -y build-essential gcc-multilib g++-multilib grub-pc-bin grub-common xorriso mtools python3
 
       - name: Compile and generate ISO
-        run: make
+        run: make all
 
       - name: Upload ISO Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LiteOS-ISO
+          name: FishOS-ISO
           path: myos.iso

@@ -1,3 +1,3 @@
-1. Browse folders
-2. Spawn Ring 3 tasks
+1. Run wine hello.exe
+2. Play Snake in terminal or GUI
 3. Enjoy multitasking

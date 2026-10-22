@@ -75,6 +75,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
     sti();
 
     bool prev_lclick = false;
+    bool prev_rclick = false;
 
     // Main OS Event & Desktop loop
     while (true) {
@@ -85,7 +86,11 @@ extern "C" void kernel_main(uint32_t magic, uint32_t addr) {
         bool lclick_released = (prev_lclick && !mouse_btn_left);
         prev_lclick = mouse_btn_left;
 
-        gui_handle_input(lclick_pressed, lclick_released);
+        bool rclick_pressed = (!prev_rclick && mouse_btn_right);
+        bool rclick_released = (prev_rclick && !mouse_btn_right);
+        prev_rclick = mouse_btn_right;
+
+        gui_handle_input(lclick_pressed, lclick_released, rclick_pressed, rclick_released);
         gui_draw();
         gfx_present();
 
