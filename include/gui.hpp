@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 struct Window {
-    int id; // 0 = Explorer, 1 = Notepad, 2 = Paint
+    int id; // 0 = Explorer, 1 = Notepad, 2 = Paint, 3 = System Monitor
     int x, y, w, h;
     int orig_x, orig_y, orig_w, orig_h;
     const char* title;
@@ -11,8 +11,9 @@ struct Window {
     bool maximized;
 };
 
-extern Window windows[3];
-extern int z_order[3];
+constexpr int WINDOW_COUNT = 4;
+extern Window windows[WINDOW_COUNT];
+extern int z_order[WINDOW_COUNT];
 extern bool start_menu_open;
 extern int blink_timer;
 

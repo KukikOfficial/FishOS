@@ -20,3 +20,15 @@ static inline uint16_t inw(uint16_t port) {
     __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
+
+static inline void io_wait() {
+    outb(0x80, 0);
+}
+
+static inline void cli() {
+    __asm__ volatile ("cli");
+}
+
+static inline void sti() {
+    __asm__ volatile ("sti");
+}

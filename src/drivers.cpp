@@ -1,6 +1,7 @@
 #include "drivers.hpp"
 #include "io.hpp"
 #include "gui.hpp"
+#include "idt.hpp"
 
 // RTC
 static uint8_t rtc_read(uint8_t reg) {
@@ -65,7 +66,7 @@ void ata_write_sector(uint32_t lba, const uint8_t* buffer) {
     while (inb(0x1F7) & 0x80);
 }
 
-// PS/2
+// PS/2 Keyboard & Mouse
 int mouse_x = 512;
 int mouse_y = 384;
 bool mouse_btn_left = false;
@@ -81,17 +82,6 @@ static void mouse_write(uint8_t val) {
 
 static uint8_t mouse_read() {
     mouse_wait_read(); return inb(0x60);
-}
-
-void mouse_init() {
-    mouse_wait_write(); outb(0x64, 0xA8);
-    mouse_wait_write(); outb(0x64, 0x20);
-    uint8_t status = mouse_read();
-    status &= ~(1 << 5); status &= ~(1 << 1); status &= ~(1 << 0);
-    mouse_wait_write(); outb(0x64, 0x60);
-    mouse_wait_write(); outb(0x60, status);
-    mouse_write(0xF6); mouse_read();
-    mouse_write(0xF4); mouse_read();
 }
 
 static char scancode_to_char(uint8_t sc, bool shift) {
@@ -143,51 +133,91 @@ static char scancode_to_char(uint8_t sc, bool shift) {
     }
 }
 
-void process_inputs() {
-    static int cycle = 0;
-    static uint8_t packet[3];
+static int mouse_cycle = 0;
+static uint8_t mouse_packet[3];
 
+static void on_keyboard_data(uint8_t data) {
+    if (data == 0x2A || data == 0x36) shift_pressed = true;
+    else if (data == 0xAA || data == 0xB6) shift_pressed = false;
+    else if (!(data & 0x80)) {
+        if (data == 0x0E) {
+            gui_handle_backspace();
+        } else {
+            char c = scancode_to_char(data, shift_pressed);
+            if (c) gui_handle_char(c);
+        }
+        if (data == 0x48) mouse_y -= 10;
+        if (data == 0x50) mouse_y += 10;
+        if (data == 0x4B) mouse_x -= 10;
+        if (data == 0x4D) mouse_x += 10;
+        if (data == 0x1C) mouse_btn_left = true;
+    } else if (data == 0x9C) {
+        mouse_btn_left = false;
+    }
+}
+
+static void on_mouse_data(uint8_t data) {
+    switch (mouse_cycle) {
+        case 0:
+            if (data & 0x08) { mouse_packet[0] = data; mouse_cycle = 1; }
+            break;
+        case 1: mouse_packet[1] = data; mouse_cycle = 2; break;
+        case 2:
+            mouse_packet[2] = data; mouse_cycle = 0;
+            mouse_btn_left = (mouse_packet[0] & 1);
+            int dx = mouse_packet[1]; if (mouse_packet[0] & 0x10) dx -= 256;
+            int dy = mouse_packet[2]; if (mouse_packet[0] & 0x20) dy -= 256;
+            mouse_x += dx; mouse_y -= dy;
+            if (mouse_x < 0) mouse_x = 0;
+            if (mouse_x >= 1024) mouse_x = 1023;
+            if (mouse_y < 0) mouse_y = 0;
+            if (mouse_y >= 768) mouse_y = 767;
+            break;
+    }
+}
+
+static void keyboard_interrupt_handler(registers_t*) {
+    uint8_t st = inb(0x64);
+    if ((st & 1) && !(st & 0x20)) {
+        uint8_t data = inb(0x60);
+        on_keyboard_data(data);
+    }
+}
+
+static void mouse_interrupt_handler(registers_t*) {
+    uint8_t st = inb(0x64);
+    if ((st & 1) && (st & 0x20)) {
+        uint8_t data = inb(0x60);
+        on_mouse_data(data);
+    }
+}
+
+void mouse_init() {
+    register_interrupt_handler(33, keyboard_interrupt_handler); // IRQ1
+    register_interrupt_handler(44, mouse_interrupt_handler);    // IRQ12
+
+    mouse_wait_write(); outb(0x64, 0xA8); // Enable auxiliary device
+    mouse_wait_write(); outb(0x64, 0x20); // Read Compaq Status
+    uint8_t status = mouse_read();
+    status |= (1 << 0) | (1 << 1);        // Enable IRQ1 and IRQ12 interrupts!
+    status &= ~((1 << 4) | (1 << 5));     // Enable keyboard and mouse clocks
+    mouse_wait_write(); outb(0x64, 0x60); // Set Status
+    mouse_wait_write(); outb(0x60, status);
+
+    mouse_write(0xF6); mouse_read();     // Set default settings
+    mouse_write(0xF4); mouse_read();     // Enable streaming
+}
+
+void process_inputs() {
+    // Process any pending bytes from keyboard/mouse in case interrupts were disabled
     while (true) {
         uint8_t st = inb(0x64);
         if (!(st & 1)) break;
         uint8_t data = inb(0x60);
-
         if (st & 0x20) {
-            switch (cycle) {
-                case 0:
-                    if (data & 0x08) { packet[0] = data; cycle = 1; }
-                    break;
-                case 1: packet[1] = data; cycle = 2; break;
-                case 2:
-                    packet[2] = data; cycle = 0;
-                    mouse_btn_left = (packet[0] & 1);
-                    int dx = packet[1]; if (packet[0] & 0x10) dx -= 256;
-                    int dy = packet[2]; if (packet[0] & 0x20) dy -= 256;
-                    mouse_x += dx; mouse_y -= dy;
-                    if (mouse_x < 0) mouse_x = 0;
-                    if (mouse_x >= 1024) mouse_x = 1023;
-                    if (mouse_y < 0) mouse_y = 0;
-                    if (mouse_y >= 768) mouse_y = 767;
-                    break;
-            }
+            on_mouse_data(data);
         } else {
-            if (data == 0x2A || data == 0x36) shift_pressed = true;
-            else if (data == 0xAA || data == 0xB6) shift_pressed = false;
-            else if (!(data & 0x80)) {
-                if (data == 0x0E) {
-                    gui_handle_backspace();
-                } else {
-                    char c = scancode_to_char(data, shift_pressed);
-                    if (c) gui_handle_char(c);
-                }
-                if (data == 0x48) mouse_y -= 10;
-                if (data == 0x50) mouse_y += 10;
-                if (data == 0x4B) mouse_x -= 10;
-                if (data == 0x4D) mouse_x += 10;
-                if (data == 0x1C) mouse_btn_left = true;
-            } else if (data == 0x9C) {
-                mouse_btn_left = false;
-            }
+            on_keyboard_data(data);
         }
     }
 }
