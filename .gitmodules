@@ -1,0 +1,3 @@
+[submodule "fihcore"]
+	path = fihcore
+	url = ../Fihcore.git

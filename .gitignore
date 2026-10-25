@@ -5,6 +5,7 @@
 # Compiled Object files
 *.slo
 *.lo
+*.o
 *.obj
 
 # Precompiled Headers
@@ -66,3 +67,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# FishOS
+*.img
+__pycache__/
+!system/apps/*.app

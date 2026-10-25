@@ -1,66 +1,48 @@
-# FishOS 🐟 (v2.1 with FishWine)
+# FishOS
 
-Полноценная 32-битная графическая операционная система на C++ и Ассемблере для архитектуры x86 (IA-32) с оконным менеджером, терминалом, играми и встроенным слоем совместимости **FishWine** для запуска исполняемых файлов Windows PE (`.exe`).
+FishOS is a small desktop operating system built on the independent
+[Fihcore](https://git.eclairs.app/eclair/Fihcore) kernel. Every part of the user
+environment — the desktop, the window manager and each application — runs as a
+separate, memory-isolated user-space process and talks to the kernel only
+through Fihcore's documented system calls.
 
----
+What you can do today:
 
-## 🚀 Архитектура и возможности
+- browse, create, rename, copy, move and delete files and folders (Files)
+- write and edit text documents with selection, clipboard and safe saving (Text Editor)
+- use a terminal with a built-in shell that also runs separate programs (Terminal)
+- watch memory, storage and processes and stop programs (System Monitor)
+- restart or shut down; everything in `/home` is kept on the data disk
 
-### 1. Подсистема FishWine (Win32 PE Loader & Emulation) 🍷
-- Собственный встроенный загрузчик формата **PE32** (Portable Executable / x86):
-  - Проверка DOS MZ заголовка (`0x5A4D`) и PE-сигнатуры (`PE\0\0`);
-  - Парсинг заголовков COFF и Optional Header (PE32 i386);
-  - Загрузка секций (`.text`, `.data`, `.rdata`) в виртуальную память;
-  - Эмуляция Win32 API функций (`MessageBoxA`, `ExitProcess`, `Sleep`, `Beep`, `GetTickCount`, `GetCommandLineA`);
-  - Окно сообщений Win32 MessageBox с кнопкой `[ OK ]` и звуковым аккордом;
-- Запуск Windows `.exe` файлов двойным кликом в Проводнике или командой `wine <file.exe>` в терминале!
-- В системе уже предзагружены бинарники `hello.exe` и `app.exe`.
+## Quick start
 
-### 2. Интерактивный Терминал (FishShell) 💻
-- Встроенная командная оболочка с историей и прокруткой:
-  - `help` — список команд;
-  - `wine <file.exe>` — запуск Windows PE исполняемого файла;
-  - `ls [path]` — просмотр содержимого папок с цветовой дифференциацией;
-  - `cd <path>`, `pwd` — навигация по директориям;
-  - `cat <file>` — просмотр текстовых файлов;
-  - `echo "текст" > файл` — запись и создание файлов;
-  - `mkdir <dir>`, `rm <path>` — файловые операции;
-  - `ps`, `free`, `uptime` — мониторинг процессов, памяти и времени аптайма;
-  - `beep [частота] [мс]` — генерация звука через PC Speaker;
-  - `theme <dark|win95|matrix>` — смена темы оформления на лету;
-  - `snake` — запуск аркады «Змейка»;
-  - `clear`, `reboot` — очистка экрана и перезагрузка.
-
-### 3. Аркада «Змейка» (Snake Game) 🎮
-- Окно классической Змейки с плавным шагом таймера PIT;
-- Управление стрелками `←`, `↑`, `→`, `↓`;
-- Спавн яблок, подсчет текущего счета и рекордов;
-- Автоматическое сохранение лучшего счета на диск в `/system/snake.score`;
-- 8-битные звуковые эффекты через PC Speaker (поедание еды, звук поражения).
-
-### 4. Темы оформления (Themes System) 🎨
-- **Modern Dark**: Современная темно-синяя палитра с градиентами;
-- **Classic Win95**: Ностальгический стиль Windows 95/2000 (серые окна `#C0C0C0`, рельефные 3D-рамки, синяя полоса заголовка);
-- **Matrix**: Черный фон и яркий неоновый зеленый текст.
-- Переключение через меню «Пуск» или команду `theme <id>` в терминале.
-
-### 5. Рабочий стол и эргономика (GUI & UX)
-- **6 иконок на рабочем столе**: Computer, Terminal, Notepad, Snake, Paint, Tasks (выделение кликом, запуск двойным кликом);
-- **Изменение размера окон мышью (Resize)**: классический рифленый уголок в правом нижнем углу каждого окна;
-- **Контекстное меню по правому клику (ПКМ)**: на рабочем столе и файлах;
-- **Навигация стрелками в Блокноте**: `←`, `→`, `↑`, `↓`, `Home`, `End`, `Delete`, `Tab` (отступ), `Ctrl+S` (быстрое сохранение со звуком);
-- **Переключение `Alt+Tab`**: циклическое переключение окон с всплывающей HUD-карточкой по центру;
-- **Звуковая обратная связь**: тактильные микро-клики при нажатии кнопок и мелодия запуска.
-
----
-
-## 🛠️ Сборка и запуск
-
-```bash
-# Сборка системы:
-make clean
-make all
-
-# Запуск в QEMU с виртуальным диском и звуком:
-make run
+```sh
+git clone --recurse-submodules ssh://git@git.eclairs.app/eclair/FishOS.git
+cd FishOS
+make run        # builds everything, creates build/data.img once, boots QEMU
+make test       # automated two-boot GUI workflow test
 ```
+
+Requirements and details: [docs/BUILDING.md](docs/BUILDING.md).
+How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+What works and what does not: [docs/STATUS.md](docs/STATUS.md).
+
+## Keyboard
+
+| Keys | Action |
+|------|--------|
+| Ctrl+Esc or Super | open the FishOS menu |
+| Alt+Tab | switch windows |
+| Alt+F4 | close the active window |
+| Files: Enter / Backspace / F2 / Delete | open / up / rename / delete |
+| Files: Ctrl+N / Ctrl+Shift+N | new document / new folder |
+| Files: Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste files |
+| Editor: Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N | save / save as / open / new |
+| Editor: Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V | select all and clipboard |
+| Terminal: Tab, Up/Down, Ctrl+C | complete, history, stop program |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The bundled fonts are derived from Source Code Pro
+and Lato under the SIL Open Font License, see
+[third_party/fonts/LICENSE-OFL.txt](third_party/fonts/LICENSE-OFL.txt).
